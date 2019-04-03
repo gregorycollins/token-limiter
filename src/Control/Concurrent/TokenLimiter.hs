@@ -119,17 +119,15 @@ tryDebit (LimitConfig maxTokens _ refillRate) (RateLimiter bucket# mv) ndebits =
                     else return (lastUpdated, True)
 
 waitForTokens :: LimitConfig -> RateLimiter -> Count -> IO ()
-waitForTokens (LimitConfig _ _ refillRate) (RateLimiter bucket# mv) ntokens = do
+waitForTokens (LimitConfig _ _ refillRate) (RateLimiter bucket# _) ntokens = do
     b <- rdBucket
     if fromIntegral b >= ntokens
       then return ()
       else do
           let numNeeded = fromIntegral ntokens - b
           let nanos = nanosPerToken * toInteger numNeeded
-          now <- nowIO
-          lt <- readMVar mv
-          let delta = toNanoSecs $ now - lt
-          let sleepMicros = max 1 (fromInteger ((nanos - delta + 100) `div` 1000))
+          let delta = nanosPerToken `div` 2
+          let sleepMicros = max 1 (fromInteger ((nanos - delta + 500) `div` 1000))
           threadDelay sleepMicros
   where
     rdBucket = readBucket bucket#
