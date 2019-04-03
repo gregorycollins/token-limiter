@@ -42,7 +42,7 @@ trivialTest = testCaseSteps "basic token limit operation" $
         startP <- readMVar startMv
         numTokensDebited <- toInteger <$> readIORef ref
         let maxNanos = toNanoSecs $ end - begin
-        let expectedNanos = toNanoSecs (end - startP) - nsPer
+        let expectedNanos = toNanoSecs (end - startP)
         let maxNumExpected = 1 + (maxNanos * toInteger qps) `div` 1000000000
         let numExpected = (expectedNanos * toInteger qps) `div` 1000000000
         let diff = fromIntegral (abs (numTokensDebited - numExpected)) /
