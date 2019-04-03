@@ -8,15 +8,17 @@
 {-# LANGUAGE UnboxedTuples #-}
 
 module Control.Concurrent.TokenLimiter
-  ( newRateLimiter
-  , tryDebit
-  , waitDebit
-  , Count
+  ( Count
   , LimitConfig(..)
   , RateLimiter
+  , newRateLimiter
+  , tryDebit
+  , waitDebit
+  , defaultLimitConfig
   ) where
 
 import Control.Concurrent
+import Data.IORef
 import Foreign.Storable
 import GHC.Generics
 import GHC.Int
@@ -30,18 +32,25 @@ data LimitConfig = LimitConfig {
     maxBucketTokens :: {-# UNPACK #-} !Count
   , initialBucketTokens :: {-# UNPACK #-} !Count
   , bucketRefillTokensPerSecond :: {-# UNPACK #-} !Count
-  } deriving (Show, Generic)
+  , clockAction :: IO TimeSpec
+  , delayAction :: TimeSpec -> IO ()
+  } deriving (Generic)
 
 data RateLimiter = RateLimiter {
     _bucketTokens :: !(MutableByteArray# RealWorld)
   , _bucketLastServiced :: {-# UNPACK #-} !(MVar TimeSpec)
   }
 
-nowIO :: IO TimeSpec
-nowIO = getTime MonotonicCoarse
+
+defaultLimitConfig :: LimitConfig
+defaultLimitConfig = LimitConfig 5 1 1 nowIO sleepIO
+  where
+    nowIO = getTime MonotonicCoarse
+    sleepIO x = threadDelay $! fromInteger (toNanoSecs x `div` 1000)
+
 
 newRateLimiter :: LimitConfig -> IO RateLimiter
-newRateLimiter (LimitConfig _ initial _) = do
+newRateLimiter (LimitConfig _ initial _ nowIO _) = do
     !now <- nowIO
     !mv <- newMVar now
     mk mv
@@ -64,9 +73,13 @@ readBucket bucket# = IO $ \s# ->
                      case readIntArray# bucket# 0# s# of
                        (# s1#, w# #) -> (# s1#, I# w# #)
 
-
 tryDebit :: LimitConfig -> RateLimiter -> Count -> IO Bool
-tryDebit (LimitConfig maxTokens _ refillRate) (RateLimiter bucket# mv) ndebits = tryGrab
+tryDebit cfg@(LimitConfig _ _ _ nowIO _) = tryDebit' nowIO cfg
+
+
+tryDebit' :: IO TimeSpec -> LimitConfig -> RateLimiter -> Count -> IO Bool
+tryDebit' nowIO (LimitConfig maxTokens _ refillRate _ _)
+         (RateLimiter bucket# mv) ndebits = tryGrab
   where
     rdBucket = readBucket bucket#
 
@@ -108,27 +121,28 @@ tryDebit (LimitConfig maxTokens _ refillRate) (RateLimiter bucket# mv) ndebits =
         if numNewTokens < ndebits
           then return (lastUpdated, False)
           else do
-              let !lastUpdated' = lastUpdated +
-                                  fromNanoSecs (toInteger numNewTokens * toInteger nanosPerToken)
               if numNewTokens == fromIntegral ndebits
-                then return (lastUpdated', True)
+                then return (now, True)
                 else do
                   b <- addLoop (numNewTokens - fromIntegral ndebits)
                   if b
-                    then return (lastUpdated', True)
+                    then return (now, True)
                     else return (lastUpdated, True)
 
-waitForTokens :: LimitConfig -> RateLimiter -> Count -> IO ()
-waitForTokens (LimitConfig _ _ refillRate) (RateLimiter bucket# _) ntokens = do
+waitForTokens :: TimeSpec -> LimitConfig -> RateLimiter -> Count -> IO ()
+waitForTokens now (LimitConfig _ _ refillRate _ sleepFor)
+              (RateLimiter bucket# mv) ntokens = do
     b <- rdBucket
     if fromIntegral b >= ntokens
       then return ()
       else do
+          lastUpdated <- readMVar mv
           let numNeeded = fromIntegral ntokens - b
+          let delta = toNanoSecs $ now - lastUpdated
           let nanos = nanosPerToken * toInteger numNeeded
-          let delta = nanosPerToken `div` 2
-          let sleepMicros = max 1 (fromInteger ((nanos - delta + 500) `div` 1000))
-          threadDelay sleepMicros
+          let sleepNanos = max 1 (fromInteger (nanos - delta + 500))
+          let !sleepSpec = fromNanoSecs sleepNanos
+          sleepFor sleepSpec
   where
     rdBucket = readBucket bucket#
     nanosPerToken = toInteger $ rateToNsPer refillRate
@@ -136,8 +150,21 @@ waitForTokens (LimitConfig _ _ refillRate) (RateLimiter bucket# _) ntokens = do
 waitDebit :: LimitConfig -> RateLimiter -> Count -> IO ()
 waitDebit lc rl ndebits = go
   where
+    -- ask for time at most once through the loop.
+    cacheClock ref = do
+        m <- readIORef ref
+        case m of
+          Nothing -> do now <- clockAction lc
+                        writeIORef ref (Just now)
+                        return now
+          (Just t) -> return t
+
     go = do
-        b <- tryDebit lc rl ndebits
+        ref <- newIORef Nothing
+        let clock = cacheClock ref
+        b <- tryDebit' clock lc rl ndebits
         if b
           then return ()
-          else waitForTokens lc rl ndebits >> go
+          else do
+            now <- clock
+            waitForTokens now lc rl ndebits >> go

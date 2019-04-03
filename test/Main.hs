@@ -1,5 +1,6 @@
 {-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 module Main ( main ) where
 
 import Control.Concurrent
@@ -19,7 +20,10 @@ main :: IO ()
 main = defaultMain tests
 
 tests :: TestTree
-tests = testGroup "token-limiter" [ trivialTest ]
+tests = testGroup "token-limiter" [
+    ioTest,
+    mockTests
+  ]
 
 nowIO :: IO TimeSpec
 nowIO = getTime MonotonicCoarse
@@ -27,8 +31,10 @@ nowIO = getTime MonotonicCoarse
 rateToNsPer :: Integral a => a -> a
 rateToNsPer tps = 1000000000 `div` tps
 
-trivialTest :: TestTree
-trivialTest = testCaseSteps "basic token limit operation" $
+-- TODO: move this test to another executable, because of the way that it works
+-- it's inherently flaky.
+ioTest :: TestTree
+ioTest = testCaseSteps "concurrent token limit operation in IO" $
               \step -> T.putStrLn "" >> go (0 :: Int) step
   where
     go !n step = do
@@ -69,11 +75,15 @@ trivialTest = testCaseSteps "basic token limit operation" $
     nthreads = 5
     qps = 1500
     nsPer = toInteger $ rateToNsPer qps
-    confidence = 95
+    confidence = 90
     approx x = (x * confidence) `div` 100
     nsecs :: Double
     nsecs = 0.5
-    ratecfg = LimitConfig bucketSz 1 qps
+    ratecfg = defaultLimitConfig {
+                 maxBucketTokens = bucketSz,
+                 initialBucketTokens = 1,
+                 bucketRefillTokensPerSecond = qps
+                 }
 
     nmillis = round (nsecs * 1000000)           -- n seconds
     wait nowMv = const $ do
@@ -95,3 +105,101 @@ trivialTest = testCaseSteps "basic token limit operation" $
             waitDebit ratecfg limiter 1
             void $ atomicModifyIORef' ref $ \x -> let !y = x+1 in (y, y)
             m
+
+mockTests :: TestTree
+mockTests = testGroup "mock tests" [
+    mockEmptyRead,
+    mockRateLimit,
+    mockDelay
+    ]
+
+mockConfig
+    :: Count
+    -> Count
+    -> Count
+    -> [Integer]
+    -> IO (IORef ([Integer] -> [Integer]), LimitConfig)
+mockConfig maxT initT refill input = do
+    inputRef <- newIORef input
+    outputRef <- newIORef id
+    let !lc = LimitConfig maxT initT refill (clock inputRef) (delay outputRef)
+    return $! (outputRef, lc)
+
+  where
+    clock ref = do
+        x <- atomicModifyIORef' ref upd
+        return $! fromNanoSecs x
+
+    upd [] = ([], error "input ran dry")
+    upd (x:xs) = (xs, x)
+
+    delay ref ts = do
+        let !nanos = toNanoSecs ts
+        atomicModifyIORef' ref $ \dl -> (dl . (nanos:), ())
+
+secsToNanos :: Integer -> Integer
+secsToNanos = (1000000000 *)
+
+millisToNanos :: Integer -> Integer
+millisToNanos = (1000000 *)
+
+nanosToMillis :: Integer -> Integer
+nanosToMillis = (`div` 1000000)
+
+microsToNanos :: Integer -> Integer
+microsToNanos = (1000 *)
+
+mockEmptyRead :: TestTree
+mockEmptyRead = testCase "time not consulted unless bucket runs empty" $ do
+    (_, cfg) <- mockConfig 3 3 1 [0, 0]
+    lm <- newRateLimiter cfg
+    let pull = tryDebit cfg lm 1
+    pull >>= assertBool "read 1"
+    pull >>= assertBool "read 2"
+    pull >>= assertBool "read 3"
+    pull >>= (assertBool "read 4" . not)
+    -- next one should run us out of clock
+    expectException pull
+
+mockRateLimit :: TestTree
+mockRateLimit = testCase "rate limit respected" $ do
+    numYesVotes <- newIORef (0 :: Int)
+    (_, cfg) <- mockConfig 1 0 1 inputs
+    lm <- newRateLimiter cfg
+    replicateM_ (length inputs0) $ trial cfg numYesVotes lm
+    y <- readIORef numYesVotes
+    assertEqual "should be four debits" 4 y
+  where
+    trial cfg ref lm = do
+        b <- tryDebit cfg lm 1
+        when b (modifyIORef' ref (+1))
+    inputs0 = map millisToNanos [0, 200 .. 4500 ]
+    inputs = (0 : inputs0) ++ repeat (millisToNanos 4500)
+
+mockDelay :: TestTree
+mockDelay = testCase "test that delay works" $ do
+    (out, cfg) <- mockConfig 1 0 1 inputs
+    lm <- newRateLimiter cfg
+    let wait = waitDebit cfg lm 1
+
+    wait
+    wait
+    wait
+    expectException wait
+
+    l <- ($ []) <$> readIORef out
+    assertEqual "outputs" expected $ map nanosToMillis l
+  where
+    inputs = 0 : inputs0
+    inputs0 = map millisToNanos [0, 1000, 1500, 2000, 2000, 3000, 3000]
+
+    expected = [1000, 500, 1000, 1000]
+
+expectException :: IO a -> IO ()
+expectException m = do
+    b <- handle h (void m >> return True)
+    when b $ fail "expected exception"
+  where
+    h (_ :: SomeException) = return False
+
+
