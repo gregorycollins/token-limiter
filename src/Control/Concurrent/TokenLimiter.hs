@@ -79,10 +79,9 @@ tryDebit (LimitConfig maxTokens _ refillRate) (RateLimiter bucket# mv) ndebits =
     tryCas !nt@(I# nt#) !(I# newVal#) =
         IO $ \s# -> case casIntArray# bucket# 0# nt# newVal# s# of
                       (# s1#, prevV# #) -> let prevV = I# prevV#
-                                               rest = do
-                                                        if prevV == nt
-                                                          then return True
-                                                          else tryGrab
+                                               rest = if prevV == nt
+                                                        then return True
+                                                        else tryGrab
                                                (IO restF) = rest
                                            in restF s1#
 
@@ -105,6 +104,7 @@ tryDebit (LimitConfig maxTokens _ refillRate) (RateLimiter bucket# mv) ndebits =
         let !nanosPerToken = toInteger $ rateToNsPer refillRate
         let !numNewTokens0 = numNanos `div` nanosPerToken
         let numNewTokens = fromIntegral numNewTokens0
+        -- TODO: allow partial debit fulfillment?
         if numNewTokens < ndebits
           then return (lastUpdated, False)
           else do
