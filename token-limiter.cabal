@@ -10,6 +10,12 @@ maintainer:          greg@gregorycollins.net
 copyright:           Copyright (C) 2019 Kadena LLC
 category:            Concurrency
 extra-source-files:  CHANGELOG.md
+homepage:            https://github.com/gregorycollins/token-limiter
+bug-reports:         https://github.com/gregorycollins/token-limiter/issues
+
+source-repository head
+    type: git
+    location: https://github.com/gregorycollins/token-limiter.git
 
 common warning-flags
     ghc-options:
