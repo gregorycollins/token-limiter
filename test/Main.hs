@@ -110,7 +110,8 @@ mockTests :: TestTree
 mockTests = testGroup "mock tests" [
     mockEmptyRead,
     mockRateLimit,
-    mockDelay
+    mockDelay,
+    mockLongerRateLimit
     ]
 
 mockConfig
@@ -175,6 +176,23 @@ mockRateLimit = testCase "rate limit respected" $ do
         when b (modifyIORef' ref (+1))
     inputs0 = map millisToNanos [0, 200 .. 4500 ]
     inputs = (0 : inputs0) ++ repeat (millisToNanos 4500)
+
+mockLongerRateLimit :: TestTree
+mockLongerRateLimit = testCase "higher rate limit" $ do
+    numYesVotes <- newIORef (0 :: Int)
+    (_, cfg) <- mockConfig 100 0 250 inputs
+    lm <- newRateLimiter cfg
+    replicateM_ (length inputs0) $ trial cfg numYesVotes lm
+    y <- readIORef numYesVotes
+    assertEqual "should be 1125 debits" 1125 y
+  where
+    trial cfg ref lm = do
+        b <- tryDebit cfg lm 1
+        when b (modifyIORef' ref (+1))
+    inputs0 = map millisToNanos [0, 2 .. 4500 ]
+    inputs = (0 : inputs0) ++ repeat (millisToNanos 4500)
+
+
 
 mockDelay :: TestTree
 mockDelay = testCase "test that delay works" $ do
