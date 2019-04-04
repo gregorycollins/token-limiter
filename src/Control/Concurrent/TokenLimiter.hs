@@ -121,12 +121,14 @@ tryDebit' nowIO (LimitConfig maxTokens _ refillRate _ _)
         if numNewTokens < ndebits
           then return (lastUpdated, False)
           else do
+              let !lastUpdated' = lastUpdated +
+                                  fromNanoSecs (toInteger numNewTokens * toInteger nanosPerToken)
               if numNewTokens == fromIntegral ndebits
-                then return (now, True)
+                then return (lastUpdated', True)
                 else do
                   b <- addLoop (numNewTokens - fromIntegral ndebits)
                   if b
-                    then return (now, True)
+                    then return (lastUpdated', True)
                     else return (lastUpdated, True)
 
 waitForTokens :: TimeSpec -> LimitConfig -> RateLimiter -> Count -> IO ()
