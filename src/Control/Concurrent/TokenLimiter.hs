@@ -14,6 +14,7 @@ module Control.Concurrent.TokenLimiter
   , RateLimiter
   , newRateLimiter
   , tryDebit
+  , penalize
   , waitDebit
   , defaultLimitConfig
   ) where
@@ -80,12 +81,34 @@ readBucket bucket# = IO $ \s# ->
                      case readIntArray# bucket# 0# s# of
                        (# s1#, w# #) -> (# s1#, I# w# #)
 
+
+-- | Unconditionally debit this amount of tokens from the rate limiter, driving
+-- it negative if necessary. Returns the new bucket balance.
+--
+-- /Since: 0.2/
+penalize :: RateLimiter -> Count -> IO Count
+penalize rl delta = addLoop
+  where
+    bucket# = _bucketTokens rl
+    rdBucket = readBucket bucket#
+    addLoop = do
+        !b@(I# bb#) <- rdBucket
+        let !ibb'@(I# bb'#) = b - delta
+        IO $ \s# -> case casIntArray# bucket# 0# bb# bb'# s# of
+                      (# s1#, prev# #) -> if (I# prev#) == b
+                                             then (# s1#, ibb' #)
+                                             else let (IO f) = addLoop in f s1#
+
+
 -- | Attempt to pull the given number of tokens from the bucket. Returns 'True'
 -- if the tokens were successfully debited.
 tryDebit :: LimitConfig -> RateLimiter -> Count -> IO Bool
-tryDebit cfg = tryDebit' (clockAction cfg) cfg
+tryDebit cfg rl cnt = do
+    let nowIO = clockAction cfg
+    snd <$> tryDebit' nowIO cfg rl cnt
 
-tryDebit' :: IO TimeSpec -> LimitConfig -> RateLimiter -> Count -> IO Bool
+
+tryDebit' :: IO TimeSpec -> LimitConfig -> RateLimiter -> Count -> IO (Int, Bool)
 tryDebit' nowIO cfg rl ndebits = tryGrab
   where
     bucket# = _bucketTokens rl
@@ -98,13 +121,13 @@ tryDebit' nowIO cfg rl ndebits = tryGrab
         !nt <- rdBucket
         if nt >= ndebits
           then tryCas nt (nt - ndebits)
-          else fetchMore
+          else fetchMore nt
 
-    tryCas !nt@(I# nt#) !(I# newVal#) =
+    tryCas !nt@(I# nt#) !newval@(I# newVal#) =
         IO $ \s# -> case casIntArray# bucket# 0# nt# newVal# s# of
                       (# s1#, prevV# #) -> let prevV = I# prevV#
                                                rest = if prevV == nt
-                                                        then return True
+                                                        then return (newval, True)
                                                         else tryGrab
                                                (IO restF) = rest
                                            in restF s1#
@@ -113,55 +136,53 @@ tryDebit' nowIO cfg rl ndebits = tryGrab
       where
         go = do
             !b@(I# bb#) <- rdBucket
-            let !(I# bb'#) = min (fromIntegral maxTokens) (b + numNewTokens)
+            let !ibb'@(I# bb'#) = min (fromIntegral maxTokens) (b + numNewTokens)
             IO $ \s# -> case casIntArray# bucket# 0# bb# bb'# s# of
                           (# s1#, prev# #) -> if (I# prev#) == b
-                                                 then (# s1#, () #)
+                                                 then (# s1#, ibb' #)
                                                  else let (IO f) = go in f s1#
 
-    fetchMore = modifyMVar mv $ \lastUpdated -> do
-        !now <- nowIO
-        let !numNanos = toNanoSecs $ now - lastUpdated
-        let !nanosPerToken = toInteger $ rateToNsPer refillRate
-        let !numNewTokens0 = numNanos `div` nanosPerToken
-        let numNewTokens = fromIntegral numNewTokens0
-        -- TODO: allow partial debit fulfillment?
-        if numNewTokens < ndebits
-          then return $! (lastUpdated, False)
-          else do
-              let !lastUpdated' = lastUpdated +
-                                  fromNanoSecs (toInteger numNewTokens * toInteger nanosPerToken)
-              if numNewTokens == fromIntegral ndebits
-                then return (lastUpdated', True)
-                else do
-                  addLoop (numNewTokens - fromIntegral ndebits)
-                  return $! (lastUpdated', True)
+    fetchMore !nt = do
+        newBalance <- modifyMVar mv $ \lastUpdated -> do
+            now <- nowIO
+            let !numNanos = toNanoSecs $ now - lastUpdated
+            let !nanosPerToken = toInteger $ rateToNsPer refillRate
+            let !numNewTokens0 = numNanos `div` nanosPerToken
+            let numNewTokens = fromIntegral numNewTokens0
+            let !lastUpdated' = lastUpdated +
+                                fromNanoSecs (toInteger numNewTokens * toInteger nanosPerToken)
+            if numNewTokens > 0
+              then do nb <- addLoop numNewTokens
+                      return (lastUpdated', nb)
+              else return (lastUpdated, nt)
+        if newBalance >= ndebits
+          then tryGrab
+          else return (newBalance, False)
 
-waitForTokens :: TimeSpec -> LimitConfig -> RateLimiter -> Count -> IO ()
-waitForTokens now cfg (RateLimiter bucket# mv) ntokens = do
-    b <- rdBucket
+
+waitForTokens :: TimeSpec -> LimitConfig -> RateLimiter -> Count -> Count -> IO ()
+waitForTokens now cfg (RateLimiter _ mv) balance ntokens = do
     lastUpdated <- readMVar mv
-    let numNeeded = fromIntegral ntokens - b
+    let numNeeded = fromIntegral ntokens - balance
     let delta = toNanoSecs $ now - lastUpdated
     let nanos = nanosPerToken * toInteger numNeeded
     let sleepNanos = max 1 (fromInteger (nanos - delta + 500))
     let !sleepSpec = fromNanoSecs sleepNanos
     sleepFor sleepSpec
   where
-    rdBucket = readBucket bucket#
     nanosPerToken = toInteger $ rateToNsPer refillRate
     refillRate = bucketRefillTokensPerSecond cfg
     sleepFor = delayAction cfg
 
+
 -- | Attempt to pull /k/ tokens from the bucket, sleeping in a loop until they
 -- become available. Will not partially fulfill token requests (i.e. it loops
 -- until the entire allotment is available in one swoop), and makes no attempt
--- at fairness or queueing (i.e. you will definitely get \"thundering herd\" on
+-- at fairness or queueing (i.e. you will probably get \"thundering herd\" on
 -- wakeup if a number of threads are contending for fresh tokens).
 waitDebit :: LimitConfig -> RateLimiter -> Count -> IO ()
 waitDebit lc rl ndebits = go
   where
-    -- ask for time at most once through the loop.
     cacheClock ref = do
         m <- readIORef ref
         case m of
@@ -169,13 +190,11 @@ waitDebit lc rl ndebits = go
                         writeIORef ref (Just now)
                         return now
           (Just t) -> return t
-
     go = do
         ref <- newIORef Nothing
         let clock = cacheClock ref
-        b <- tryDebit' clock lc rl ndebits
+        (balance, b) <- tryDebit' clock lc rl ndebits
         if b
           then return $! ()
-          else do
-            now <- clock
-            waitForTokens now lc rl ndebits >> go
+          else do now <- clock
+                  waitForTokens now lc rl balance ndebits >> go

@@ -49,7 +49,7 @@ ioTest = testCaseSteps "concurrent token limit operation in IO" $
         numTokensDebited <- toInteger <$> readIORef ref
         let maxNanos = toNanoSecs $ end - begin
         let expectedNanos = toNanoSecs (end - startP)
-        let maxNumExpected = 1 + (maxNanos * toInteger qps) `div` 1000000000
+        let maxNumExpected = 4 + (maxNanos * toInteger qps) `div` 1000000000
         let numExpected = (expectedNanos * toInteger qps) `div` 1000000000
         let diff = fromIntegral (abs (numTokensDebited - numExpected)) /
                    ((fromIntegral numExpected) :: Double)
@@ -111,7 +111,8 @@ mockTests = testGroup "mock tests" [
     mockEmptyRead,
     mockRateLimit,
     mockDelay,
-    mockLongerRateLimit
+    mockLongerRateLimit,
+    mockPenalize
     ]
 
 mockConfig
@@ -212,6 +213,24 @@ mockDelay = testCase "test that delay works" $ do
     inputs0 = map millisToNanos [0, 1000, 1500, 2000, 2000, 3000, 3000]
 
     expected = [1000, 500, 1000, 1000]
+
+mockPenalize :: TestTree
+mockPenalize = testCase "penalize" $ do
+    numYesVotes <- newIORef (0 :: Int)
+    (_, cfg) <- mockConfig 100 0 250 inputs
+    lm <- newRateLimiter cfg
+    replicateM_ (length inputs0) $ trial cfg numYesVotes lm
+    y <- readIORef numYesVotes
+    assertEqual "should be 563 debits" 563 y
+  where
+    trial cfg ref lm = do
+        b <- tryDebit cfg lm 1
+        when b $ do
+            modifyIORef' ref (+1)
+            void $ penalize lm 1
+    inputs0 = map millisToNanos [0, 2 .. 4500 ]
+    inputs = (0 : inputs0) ++ repeat (millisToNanos 4500)
+
 
 expectException :: IO a -> IO ()
 expectException m = do
