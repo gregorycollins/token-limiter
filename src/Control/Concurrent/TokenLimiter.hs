@@ -38,8 +38,8 @@ data LimitConfig = LimitConfig {
   , bucketRefillTokensPerSecond :: {-# UNPACK #-} !Count
       -- ^ how many tokens should replenish the bucket per second.
   , clockAction :: IO TimeSpec
-      -- ^ clock action, 'defaultLimitConfig' uses the coarse monotonic system
-      -- clock. Mostly provided for mocking in the testsuite.
+      -- ^ clock action, 'defaultLimitConfig' uses the monotonic system clock.
+      -- Mostly provided for mocking in the testsuite.
   , delayAction :: TimeSpec -> IO ()
       -- ^ action to delay for the given time interval. 'defaultLimitConfig'
       -- forwards to 'threadDelay'. Provided for mocking.
@@ -54,7 +54,7 @@ data RateLimiter = RateLimiter {
 defaultLimitConfig :: LimitConfig
 defaultLimitConfig = LimitConfig 5 1 1 nowIO sleepIO
   where
-    nowIO = getTime MonotonicCoarse
+    nowIO = getTime Monotonic
     sleepIO x = threadDelay $! fromInteger (toNanoSecs x `div` 1000)
 
 
