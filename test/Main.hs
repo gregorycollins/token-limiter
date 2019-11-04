@@ -26,7 +26,7 @@ tests = testGroup "token-limiter" [
   ]
 
 nowIO :: IO TimeSpec
-nowIO = getTime MonotonicCoarse
+nowIO = getTime Monotonic
 
 rateToNsPer :: Integral a => a -> a
 rateToNsPer tps = 1000000000 `div` tps
